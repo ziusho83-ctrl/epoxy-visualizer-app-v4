@@ -138,7 +138,7 @@ async function traceMaskContour(maskBuf: Buffer): Promise<Pt[]> {
 
   // Extract 0.5 isoline using marching squares
   const contourGenerator = contours().size([w, h])
-  const isoContours = contourGenerator.contour(values, 0.5)
+  const isoContours = contourGenerator.contour(Array.from(values), 0.5)
 
   // isoContours.coordinates is MultiPolygon: number[][][][]
   // Pick the longest ring (outer boundary)
