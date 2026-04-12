@@ -1,5 +1,5 @@
 /**
- * POST /api/auto-mask (V3)
+ * POST /api/auto-mask (V4)
  *
  * Uses Grounded SAM (Grounding DINO + SAM) via Replicate to segment the garage
  * floor using text prompts. This replaces Mask2Former's scene-parsing approach
@@ -12,6 +12,7 @@
 
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import sharp from 'sharp'
+import { contours } from 'd3-contour'
 
 const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN
 // schananas/grounded_sam: Grounding DINO + SAM with text prompts
@@ -115,96 +116,160 @@ async function traceMaskContour(maskBuf: Buffer): Promise<Pt[]> {
     if (labels[i] === bestLabel) blob[i] = 1
   }
 
-  // --- Moore-neighbor boundary trace starting from first blob pixel ---
-  // Find starting point: topmost-leftmost blob pixel.
-  let startX = -1, startY = -1
-  outer: for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      if (blob[y * w + x] === 1) { startX = x; startY = y; break outer }
-    }
+  // --- Gaussian blur + Marching Squares contour extraction ---
+  // Create a buffer from only the selected component, smooth it, then extract contour
+  const blobBuf = Buffer.alloc(w * h)
+  for (let i = 0; i < w * h; i++) {
+    if (blob[i] === 1) blobBuf[i] = 255
   }
-  if (startX < 0) return []
 
-  // 8-neighbor offsets in clockwise order, starting from "west"
-  const neighbors = [
-    [-1, 0], [-1, -1], [0, -1], [1, -1],
-    [1, 0], [1, 1], [0, 1], [-1, 1],
-  ]
-  const contour: Pt[] = []
-  let x = startX, y = startY
-  let dir = 0 // entering from west
-  let steps = 0
-  const maxSteps = w * h * 2
+  // Apply Gaussian blur (sigma ~3) then re-threshold to smooth jagged edges
+  const smoothedBuf = await sharp(blobBuf, { raw: { width: w, height: h, channels: 1 } })
+    .blur(3)
+    .threshold(127)
+    .raw()
+    .toBuffer()
 
-  do {
-    contour.push({ x, y })
-    // Starting from (dir + 6) % 8 (= left of entry), find next boundary pixel CW
-    let found = false
-    for (let k = 0; k < 8; k++) {
-      const d = (dir + 6 + k) % 8
-      const nx = x + neighbors[d][0]
-      const ny = y + neighbors[d][1]
-      if (nx >= 0 && nx < w && ny >= 0 && ny < h && blob[ny * w + nx] === 1) {
-        x = nx
-        y = ny
-        dir = d
-        found = true
-        break
+  // Build Float64Array for d3-contour (1 = foreground, 0 = background)
+  const values = new Float64Array(w * h)
+  for (let i = 0; i < w * h; i++) {
+    values[i] = smoothedBuf[i] > 127 ? 1 : 0
+  }
+
+  // Extract 0.5 isoline using marching squares
+  const contourGenerator = contours().size([w, h])
+  const isoContours = contourGenerator.contour(values, 0.5)
+
+  // isoContours.coordinates is MultiPolygon: number[][][][]
+  // Pick the longest ring (outer boundary)
+  let longest: Array<[number, number]> = []
+  for (const polygon of isoContours.coordinates) {
+    for (const ring of polygon) {
+      if (ring.length > longest.length) {
+        longest = ring as Array<[number, number]>
       }
     }
-    if (!found) break
-    steps++
-    if (steps > maxSteps) break
-  } while (!(x === startX && y === startY && contour.length > 2))
+  }
 
-  console.log(`Traced contour: ${contour.length} raw points`)
+  if (longest.length < 3) return []
 
-  // Normalize to 0-100 space
-  return contour.map((p) => ({
-    x: (p.x / w) * 100,
-    y: (p.y / h) * 100,
+  console.log(`Marching squares contour: ${longest.length} raw points`)
+
+  // Convert to {x, y} normalized 0-100
+  const rawContour = longest.map(([px, py]) => ({
+    x: (px / w) * 100,
+    y: (py / h) * 100,
   }))
+
+  return rawContour
 }
 
+// Legacy: kept for reference, replaced by visvalingamWhyatt above
+// function douglasPeucker(pts: Pt[], epsilon: number): Pt[] {
+//   if (pts.length < 3) return pts.slice()
+//
+//   const perpDist = (p: Pt, a: Pt, b: Pt): number => {
+//     const dx = b.x - a.x
+//     const dy = b.y - a.y
+//     const mag = Math.sqrt(dx * dx + dy * dy)
+//     if (mag < 1e-9) {
+//       const dxp = p.x - a.x
+//       const dyp = p.y - a.y
+//       return Math.sqrt(dxp * dxp + dyp * dyp)
+//     }
+//     return Math.abs(dy * p.x - dx * p.y + b.x * a.y - b.y * a.x) / mag
+//   }
+//
+//   const simplify = (start: number, end: number): Pt[] => {
+//     if (end - start < 2) return [pts[start]]
+//     let maxDist = 0
+//     let maxIdx = start
+//     for (let i = start + 1; i < end; i++) {
+//       const d = perpDist(pts[i], pts[start], pts[end])
+//       if (d > maxDist) {
+//         maxDist = d
+//         maxIdx = i
+//       }
+//     }
+//     if (maxDist > epsilon) {
+//       const left = simplify(start, maxIdx)
+//       const right = simplify(maxIdx, end)
+//       return left.concat(right.slice(1))
+//     }
+//     return [pts[start], pts[end]]
+//   }
+//
+//   return simplify(0, pts.length - 1)
+// }
+
 /**
- * Douglas-Peucker polyline simplification: drops points within `epsilon`
- * of the line between their neighbors. Preserves corners, removes clusters.
+ * Visvalingam-Whyatt simplification: iteratively removes the point forming
+ * the smallest triangle area with its neighbors until targetCount is reached.
+ * Better than Douglas-Peucker for preserving shape character.
  */
-function douglasPeucker(pts: Pt[], epsilon: number): Pt[] {
-  if (pts.length < 3) return pts.slice()
+function visvalingamWhyatt(pts: Pt[], targetCount: number): Pt[] {
+  if (pts.length <= targetCount) return pts.slice();
 
-  const perpDist = (p: Pt, a: Pt, b: Pt): number => {
-    const dx = b.x - a.x
-    const dy = b.y - a.y
-    const mag = Math.sqrt(dx * dx + dy * dy)
-    if (mag < 1e-9) {
-      const dxp = p.x - a.x
-      const dyp = p.y - a.y
-      return Math.sqrt(dxp * dxp + dyp * dyp)
-    }
-    return Math.abs(dy * p.x - dx * p.y + b.x * a.y - b.y * a.x) / mag
+  type VWNode = {
+    point: Pt;
+    area: number;
+    prev: VWNode | null;
+    next: VWNode | null;
+    removed: boolean;
+  };
+
+  const nodes: VWNode[] = pts.map(p => ({
+    point: p, area: Infinity, prev: null, next: null, removed: false
+  }));
+  for (let i = 0; i < nodes.length; i++) {
+    nodes[i].prev = i > 0 ? nodes[i - 1] : null;
+    nodes[i].next = i < nodes.length - 1 ? nodes[i + 1] : null;
   }
 
-  const simplify = (start: number, end: number): Pt[] => {
-    if (end - start < 2) return [pts[start]]
-    let maxDist = 0
-    let maxIdx = start
-    for (let i = start + 1; i < end; i++) {
-      const d = perpDist(pts[i], pts[start], pts[end])
-      if (d > maxDist) {
-        maxDist = d
-        maxIdx = i
+  function triangleArea(a: Pt, b: Pt, c: Pt): number {
+    return Math.abs((a.x - c.x) * (b.y - a.y) - (a.x - b.x) * (c.y - a.y)) / 2;
+  }
+
+  function calcArea(node: VWNode): number {
+    if (!node.prev || !node.next) return Infinity;
+    return triangleArea(node.prev.point, node.point, node.next.point);
+  }
+
+  for (const n of nodes) n.area = calcArea(n);
+
+  let remaining = pts.length;
+  while (remaining > targetCount) {
+    let minNode: VWNode | null = null;
+    let minArea = Infinity;
+    let current: VWNode | null = nodes[0].next;
+    while (current && current.next) {
+      if (current.area < minArea) {
+        minArea = current.area;
+        minNode = current;
       }
+      current = current.next;
     }
-    if (maxDist > epsilon) {
-      const left = simplify(start, maxIdx)
-      const right = simplify(maxIdx, end)
-      return left.concat(right.slice(1))
-    }
-    return [pts[start], pts[end]]
+    if (!minNode) break;
+
+    // Remove it
+    if (minNode.prev) minNode.prev.next = minNode.next;
+    if (minNode.next) minNode.next.prev = minNode.prev;
+    minNode.removed = true;
+
+    // Recalculate neighbors with monotonicity
+    if (minNode.prev) minNode.prev.area = Math.max(calcArea(minNode.prev), minArea);
+    if (minNode.next) minNode.next.area = Math.max(calcArea(minNode.next), minArea);
+
+    remaining--;
   }
 
-  return simplify(0, pts.length - 1)
+  const result: Pt[] = [];
+  let node: VWNode | null = nodes[0];
+  while (node) {
+    result.push(node.point);
+    node = node.next;
+  }
+  return result;
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -308,20 +373,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({ points: [], error: 'No floor detected in this image' })
     }
 
-    // Simplify with Douglas-Peucker
-    const simplified = douglasPeucker(rawContour, 0.2)
-    console.log(`DP simplified: ${rawContour.length} → ${simplified.length}`)
-
-    // Cap to a reasonable number of points for editing UX
-    const MAX_POINTS = 160
-    let final = simplified
-    if (final.length > MAX_POINTS) {
-      // Re-run DP with larger epsilon until under cap
-      for (let eps = 0.3; eps <= 2.5; eps += 0.15) {
-        final = douglasPeucker(rawContour, eps)
-        if (final.length <= MAX_POINTS) break
-      }
-    }
+    // Visvalingam-Whyatt: target 120 points (preserves corners)
+    const MAX_POINTS = 120
+    const final = visvalingamWhyatt(rawContour, MAX_POINTS)
+    console.log(`VW simplified: ${rawContour.length} → ${final.length}`)
 
     return res.status(200).json({ points: final })
   } catch (err) {
