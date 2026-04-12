@@ -127,6 +127,7 @@ async function traceMaskContour(maskBuf: Buffer): Promise<Pt[]> {
   const smoothedBuf = await sharp(blobBuf, { raw: { width: w, height: h, channels: 1 } })
     .blur(3)
     .threshold(127)
+    .toColourspace("b-w")
     .raw()
     .toBuffer()
 
