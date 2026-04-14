@@ -3,7 +3,6 @@ import './App.css'
 import { flakeBlends, solidColors } from './data/palette'
 
 type Point = { x: number; y: number }
-type Rect = { x1: number; y1: number; x2: number; y2: number }
 
 type FlakeDot = { x: number; y: number; r: number; c: number }
 
@@ -618,7 +617,7 @@ function App() {
   return (
     <main className="wrap">
       <header>
-        <h1>Epoxy Visualizer V3 • Grounded SAM</h1>
+        <h1>Epoxy Visualizer V4 • Grounded SAM</h1>
         <p>Mobile-first before/after preview builder for garage flooring.</p>
       </header>
 
@@ -648,7 +647,6 @@ function App() {
               <button onClick={() => void autoDetectFloorMask()} disabled={autoMaskLoading}>
                 {autoMaskLoading ? 'Detecting…' : 'Auto Detect Floor (Beta)'}
               </button>
-              
               <button
                 onClick={() => {
                   setMaskPoints((pts) => pts.slice(0, -1))
@@ -674,7 +672,6 @@ function App() {
                 const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect()
                 const p = toNormalizedPoint(e.clientX, e.clientY, rect)
 
-
                 if (dragIndex !== null) return
                 const target = e.target as HTMLElement
                 if (target.dataset.point === 'mask-dot') return
@@ -685,16 +682,11 @@ function App() {
                 const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect()
                 const p = toNormalizedPoint(e.clientX, e.clientY, rect)
 
-                  return
-                }
-
                 if (dragIndex === null) return
                 updateMaskPoint(dragIndex, e.clientX, e.clientY, rect)
                 setMaskMode('manual')
               }}
               onPointerUp={() => {
-                  setMaskMode('manual')
-                }
                 setDragIndex(null)
               }}
               onPointerLeave={() => {
