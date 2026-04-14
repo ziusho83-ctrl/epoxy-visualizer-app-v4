@@ -18,8 +18,8 @@ const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN
 // schananas/grounded_sam: Grounding DINO + SAM with text prompts
 const MODEL_VERSION = 'ee871c19efb1941f55f66a3d7d960428c8a5afcb77449547fe8e5a3ab9ebc21c'
 
-const FLOOR_PROMPT = 'garage floor,concrete floor,epoxy floor'
-const NEGATIVE_PROMPT = 'wall,ceiling,garage door,cabinet,door,shelf,car'
+const FLOOR_PROMPT = 'garage floor,concrete floor,epoxy floor,ground,pavement'
+const NEGATIVE_PROMPT = 'wall,ceiling,garage door,cabinet,door,shelf,car,sky,roof,driveway,window,light fixture,beam,rafter'
 
 type Pt = { x: number; y: number }
 
@@ -62,6 +62,7 @@ async function traceMaskContour(maskBuf: Buffer): Promise<Pt[]> {
   const labels = new Int32Array(w * h)
   const sizes: number[] = [0]
   const botYs: number[] = [0] // track max Y (bottom-most row) per component
+  const sumYs: number[] = [0] // track sum of Y values for centroid calculation
   const stack: number[] = []
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
@@ -70,16 +71,19 @@ async function traceMaskContour(maskBuf: Buffer): Promise<Pt[]> {
         const label = sizes.length
         sizes.push(0)
         botYs.push(0)
+        sumYs.push(0)
         stack.push(i)
         labels[i] = label
         let count = 0
         let maxY = 0
+        let sumY = 0
         while (stack.length > 0) {
           const k = stack.pop()!
           const ky = Math.floor(k / w)
           const kx = k - ky * w
           count++
           if (ky > maxY) maxY = ky
+          sumY += ky
           if (kx > 0 && occ[k - 1] === 1 && labels[k - 1] === 0) { labels[k - 1] = label; stack.push(k - 1) }
           if (kx < w - 1 && occ[k + 1] === 1 && labels[k + 1] === 0) { labels[k + 1] = label; stack.push(k + 1) }
           if (ky > 0 && occ[k - w] === 1 && labels[k - w] === 0) { labels[k - w] = label; stack.push(k - w) }
@@ -87,17 +91,29 @@ async function traceMaskContour(maskBuf: Buffer): Promise<Pt[]> {
         }
         sizes[label] = count
         botYs[label] = maxY
+        sumYs[label] = sumY
       }
     }
   }
 
-  // Filter by min area, then pick the component whose bottom edge reaches
-  // lowest (highest Y value). Break ties by size (largest wins).
+  // Filter by min area + centroid position, then pick floor component.
+  // Reject components whose centroid is in the top 40% of the image (ceiling/wall).
+  // Among remaining, prefer lowest botY, break ties by size.
+  const CEILING_CUTOFF = 0.40 // centroid must be below this fraction of image height
   let bestLabel = 0
   let bestBotY = -1
   let bestSize = 0
+  let candidateCount = 0
   for (let lbl = 1; lbl < sizes.length; lbl++) {
     if (sizes[lbl] < totalPixels * MIN_AREA_FRAC) continue // skip tiny strips
+    const centroidY = sumYs[lbl] / sizes[lbl]
+    const centroidFrac = centroidY / h
+    console.log(`  component ${lbl}: size=${sizes[lbl]} (${(sizes[lbl]/totalPixels*100).toFixed(1)}%) centroidY=${centroidFrac.toFixed(2)} botY=${botYs[lbl]}`)
+    if (centroidFrac < CEILING_CUTOFF) {
+      console.log(`  -> rejected (centroid in top ${(CEILING_CUTOFF*100).toFixed(0)}%, likely ceiling/wall)`)
+      continue
+    }
+    candidateCount++
     if (
       botYs[lbl] > bestBotY ||
       (botYs[lbl] === bestBotY && sizes[lbl] > bestSize)
@@ -107,8 +123,11 @@ async function traceMaskContour(maskBuf: Buffer): Promise<Pt[]> {
       bestSize = sizes[lbl]
     }
   }
-  if (bestLabel === 0) return []
-  console.log(`Grounded SAM mask: ${sizes.length - 1} components, picked label ${bestLabel} size=${bestSize} botY=${bestBotY} (0.5% min threshold)`)
+  if (bestLabel === 0) {
+    console.log(`No valid floor component found (${sizes.length - 1} total, ${candidateCount} passed filters)`)
+    return []
+  }
+  console.log(`Grounded SAM mask: ${sizes.length - 1} components, picked label ${bestLabel} size=${bestSize} botY=${bestBotY} centroidY=${(sumYs[bestLabel]/sizes[bestLabel]/h).toFixed(2)} (0.5% min, ${(CEILING_CUTOFF*100).toFixed(0)}% ceiling cutoff)`)
 
   // Keep only the selected component
   const blob = new Uint8Array(w * h)
