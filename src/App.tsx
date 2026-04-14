@@ -69,11 +69,9 @@ function App() {
   const [selectedFlake, setSelectedFlake] = useState<string>('Stonewash')
   const [imageUrl, setImageUrl] = useState<string>('')
   const [maskPoints, setMaskPoints] = useState<Point[]>([])
-  const [maskMode, setMaskMode] = useState<'manual' | 'auto' | 'quick'>('manual')
+  const [maskMode, setMaskMode] = useState<'manual' | 'auto'>('manual')
   const [autoMaskStatus, setAutoMaskStatus] = useState('')
   const [autoMaskLoading, setAutoMaskLoading] = useState(false)
-  const [quickRect, setQuickRect] = useState<Rect | null>(null)
-  const [quickDragStart, setQuickDragStart] = useState<Point | null>(null)
   const [compare, setCompare] = useState(100)
   const [dragIndex, setDragIndex] = useState<number | null>(null)
   const [projectName] = useState('')
@@ -636,8 +634,6 @@ function App() {
             setMaskPoints([])
             setMaskMode('manual')
             setAutoMaskStatus('')
-            setQuickRect(null)
-            setQuickDragStart(null)
           }}
         />
         {!imageUrl && <p className="muted">No image yet.</p>}
@@ -652,14 +648,7 @@ function App() {
               <button onClick={() => void autoDetectFloorMask()} disabled={autoMaskLoading}>
                 {autoMaskLoading ? 'Detecting…' : 'Auto Detect Floor (Beta)'}
               </button>
-              <button
-                onClick={() => {
-                  setMaskMode('quick')
-                  setAutoMaskStatus('Quick mode: drag a rectangle across the floor area, then release.')
-                }}
-              >
-                Quick Select Mode
-              </button>
+              
               <button
                 onClick={() => {
                   setMaskPoints((pts) => pts.slice(0, -1))
@@ -672,11 +661,9 @@ function App() {
               <button
                 onClick={() => {
                   setMaskPoints([])
-                  setQuickRect(null)
-                  setQuickDragStart(null)
                   setMaskMode('manual')
                 }}
-                disabled={!maskPoints.length && !quickRect}
+                disabled={!maskPoints.length}
               >
                 Clear mask
               </button>
@@ -687,11 +674,6 @@ function App() {
                 const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect()
                 const p = toNormalizedPoint(e.clientX, e.clientY, rect)
 
-                if (maskMode === 'quick') {
-                  setQuickDragStart(p)
-                  setQuickRect({ x1: p.x, y1: p.y, x2: p.x, y2: p.y })
-                  return
-                }
 
                 if (dragIndex !== null) return
                 const target = e.target as HTMLElement
@@ -703,8 +685,6 @@ function App() {
                 const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect()
                 const p = toNormalizedPoint(e.clientX, e.clientY, rect)
 
-                if (maskMode === 'quick' && quickDragStart) {
-                  setQuickRect({ x1: quickDragStart.x, y1: quickDragStart.y, x2: p.x, y2: p.y })
                   return
                 }
 
@@ -713,29 +693,11 @@ function App() {
                 setMaskMode('manual')
               }}
               onPointerUp={() => {
-                if (maskMode === 'quick' && quickRect) {
-                  const left = Math.max(0, Math.min(99, Math.min(quickRect.x1, quickRect.x2)))
-                  const right = Math.max(1, Math.min(100, Math.max(quickRect.x1, quickRect.x2)))
-                  const top = Math.max(8, Math.min(92, Math.min(quickRect.y1, quickRect.y2)))
-                  const bottom = Math.max(top + 2, Math.min(100, Math.max(quickRect.y1, quickRect.y2)))
-                  const centerX = (left + right) / 2
-                  const apexY = Math.max(3, top - Math.max(2, (bottom - top) * 0.16))
-
-                  setMaskPoints([
-                    { x: left, y: top },
-                    { x: centerX, y: apexY },
-                    { x: right, y: top },
-                    { x: right, y: bottom },
-                    { x: left, y: bottom },
-                  ])
-                  setAutoMaskStatus('Quick selection applied. Drag points to refine.')
                   setMaskMode('manual')
                 }
-                setQuickDragStart(null)
                 setDragIndex(null)
               }}
               onPointerLeave={() => {
-                setQuickDragStart(null)
                 setDragIndex(null)
               }}
             >
@@ -749,15 +711,6 @@ function App() {
               <svg className="mask-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
                 {maskPoints.length >= 3 && <polygon className="mask-fill" points={polygonPointsAttr} />}
                 {maskPoints.length >= 2 && <polyline className="mask-line" fill="none" points={polygonPointsAttr} />}
-                {quickRect && maskMode === 'quick' && (
-                  <rect
-                    className="quick-rect"
-                    x={Math.min(quickRect.x1, quickRect.x2)}
-                    y={Math.min(quickRect.y1, quickRect.y2)}
-                    width={Math.abs(quickRect.x2 - quickRect.x1)}
-                    height={Math.abs(quickRect.y2 - quickRect.y1)}
-                  />
-                )}
                 {maskPoints.map((p, idx) => (
                   <circle
                     key={`${p.x}-${p.y}-${idx}`}
@@ -774,7 +727,7 @@ function App() {
                 ))}
               </svg>
             </div>
-            <small>{maskPoints.length} point(s) selected • Mode: {maskMode === 'auto' ? 'Auto' : maskMode === 'quick' ? 'Quick Select' : 'Manual'}</small>
+            <small>{maskPoints.length} point(s) selected • Mode: {maskMode === 'auto' ? 'Auto' : 'Manual'}</small>
             {autoMaskStatus && <small className="muted">{autoMaskStatus}</small>}
           </>
         ) : (

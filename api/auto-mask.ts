@@ -21,6 +21,10 @@ const MODEL_VERSION = 'ee871c19efb1941f55f66a3d7d960428c8a5afcb77449547fe8e5a3ab
 const FLOOR_PROMPT = 'garage floor,concrete floor,epoxy floor,ground,pavement'
 const NEGATIVE_PROMPT = 'wall,ceiling,garage door,cabinet,door,shelf,car,sky,roof,driveway,window,light fixture,beam,rafter'
 
+// Fallback prompts for when primary detection fails (e.g. dark stained floors)
+const FALLBACK_FLOOR_PROMPT = 'concrete surface,ground surface,flat ground,floor surface,slab'
+const FALLBACK_NEGATIVE_PROMPT = 'wall,ceiling,sky,roof,door,window,car'
+
 type Pt = { x: number; y: number }
 
 /**
@@ -99,7 +103,7 @@ async function traceMaskContour(maskBuf: Buffer): Promise<Pt[]> {
   // Filter by min area + centroid position, then pick floor component.
   // Reject components whose centroid is in the top 40% of the image (ceiling/wall).
   // Among remaining, prefer lowest botY, break ties by size.
-  const CEILING_CUTOFF = 0.40 // centroid must be below this fraction of image height
+  const CEILING_CUTOFF = 0.30 // centroid must be below this fraction of image height
   let bestLabel = 0
   let bestBotY = -1
   let bestSize = 0
@@ -312,84 +316,104 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(413).json({ error: 'Image too large (max ~10 MB)' })
     }
 
-    // --- Step 1: Create Grounded SAM prediction (with retry for 429) ---
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let result: any = null
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const createRes = await fetch('https://api.replicate.com/v1/predictions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${REPLICATE_API_TOKEN}`,
-        },
-        body: JSON.stringify({
-          version: MODEL_VERSION,
-          input: {
-            image: imageDataUrl,
-            mask_prompt: FLOOR_PROMPT,
-            negative_mask_prompt: NEGATIVE_PROMPT,
-            adjustment_factor: 0,
+    // --- Helper: run Grounded SAM with given prompts ---
+    async function runSegmentation(
+      floorPrompt: string,
+      negPrompt: string,
+      label: string
+    ): Promise<Pt[] | null> {
+      console.log(`[${label}] Running with prompt: "${floorPrompt}"`)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let result: any = null
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const createRes = await fetch('https://api.replicate.com/v1/predictions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${REPLICATE_API_TOKEN}`,
           },
-        }),
-      })
+          body: JSON.stringify({
+            version: MODEL_VERSION,
+            input: {
+              image: imageDataUrl,
+              mask_prompt: floorPrompt,
+              negative_mask_prompt: negPrompt,
+              adjustment_factor: 0,
+            },
+          }),
+        })
 
-      if (createRes.status === 429) {
-        console.log(`Replicate 429 on attempt ${attempt + 1}, retrying...`)
-        await new Promise((r) => setTimeout(r, (attempt + 1) * 3000))
-        continue
+        if (createRes.status === 429) {
+          console.log(`[${label}] Replicate 429 on attempt ${attempt + 1}, retrying...`)
+          await new Promise((r) => setTimeout(r, (attempt + 1) * 3000))
+          continue
+        }
+
+        if (!createRes.ok) {
+          const err = await createRes.text()
+          console.error(`[${label}] Replicate create error:`, createRes.status, err)
+          return null
+        }
+
+        result = await createRes.json()
+        break
       }
 
-      if (!createRes.ok) {
-        const err = await createRes.text()
-        console.error('Replicate create error:', createRes.status, err)
-        return res.status(502).json({ error: `Replicate API error (${createRes.status})` })
+      if (!result) return null
+
+      // Poll until complete
+      const maxWait = 160_000
+      const start = Date.now()
+      while (result.status !== 'succeeded' && result.status !== 'failed' && result.status !== 'canceled') {
+        if (Date.now() - start > maxWait) {
+          console.error(`[${label}] Timed out`)
+          return null
+        }
+        await new Promise((r) => setTimeout(r, 1500))
+        const pollRes = await fetch(result.urls.get, {
+          headers: { Authorization: `Bearer ${REPLICATE_API_TOKEN}` },
+        })
+        result = await pollRes.json()
       }
 
-      result = await createRes.json()
-      break
-    }
-
-    if (!result) {
-      return res.status(429).json({ error: 'Rate limited by Replicate, try again in a moment' })
-    }
-
-    // --- Step 2: Poll until complete ---
-    const maxWait = 160_000
-    const start = Date.now()
-    while (result.status !== 'succeeded' && result.status !== 'failed' && result.status !== 'canceled') {
-      if (Date.now() - start > maxWait) {
-        return res.status(504).json({ error: 'Segmentation timed out (model may be cold-starting, try again)' })
+      if (result.status === 'failed') {
+        console.error(`[${label}] Replicate failed:`, result.error)
+        return null
       }
-      await new Promise((r) => setTimeout(r, 1500))
-      const pollRes = await fetch(result.urls.get, {
-        headers: { Authorization: `Bearer ${REPLICATE_API_TOKEN}` },
-      })
-      result = await pollRes.json()
+
+      // Download mask
+      const output = result.output
+      if (!Array.isArray(output) || output.length < 3) {
+        console.error(`[${label}] Unexpected output shape:`, output)
+        return null
+      }
+      const maskUrl = output[2]
+      const maskRes = await fetch(maskUrl)
+      if (!maskRes.ok) {
+        console.error(`[${label}] Failed to download mask`)
+        return null
+      }
+      const maskBuf = Buffer.from(await maskRes.arrayBuffer())
+
+      const rawContour = await traceMaskContour(maskBuf)
+      if (rawContour.length < 3) {
+        console.log(`[${label}] No valid contour found`)
+        return null
+      }
+
+      console.log(`[${label}] Got ${rawContour.length} raw contour points`)
+      return rawContour
     }
 
-    if (result.status === 'failed') {
-      console.error('Replicate failed:', result.error)
-      return res.status(502).json({ error: 'Segmentation failed', detail: result.error })
+    // --- Try primary prompt, then fallback if no floor detected ---
+    let rawContour = await runSegmentation(FLOOR_PROMPT, NEGATIVE_PROMPT, 'primary')
+
+    if (!rawContour) {
+      console.log('Primary detection failed, trying fallback prompt...')
+      rawContour = await runSegmentation(FALLBACK_FLOOR_PROMPT, FALLBACK_NEGATIVE_PROMPT, 'fallback')
     }
 
-    // --- Step 3: Download mask and trace contour ---
-    // grounded_sam output is an array: [annotated, neg_annotated, mask, inverted_mask]
-    // We want the positive mask (index 2)
-    const output = result.output
-    if (!Array.isArray(output) || output.length < 3) {
-      console.error('Unexpected Grounded SAM output shape:', output)
-      return res.status(502).json({ error: 'No segmentation mask returned' })
-    }
-    const maskUrl = output[2]
-    const maskRes = await fetch(maskUrl)
-    if (!maskRes.ok) {
-      return res.status(502).json({ error: 'Failed to download segmentation mask' })
-    }
-    const maskBuf = Buffer.from(await maskRes.arrayBuffer())
-
-    // Trace the largest connected mask contour
-    const rawContour = await traceMaskContour(maskBuf)
-    if (rawContour.length < 3) {
+    if (!rawContour) {
       return res.status(200).json({ points: [], error: 'No floor detected in this image' })
     }
 
