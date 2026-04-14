@@ -51,10 +51,6 @@ async function traceMaskContour(maskBuf: Buffer): Promise<Pt[]> {
       whiteCount++
     }
   }
-  // If white is the majority, the mask is probably inverted
-  if (whiteCount > w * h * 0.5) {
-    for (let i = 0; i < w * h; i++) occ[i] = occ[i] === 1 ? 0 : 1
-  }
 
   // --- Find connected components (4-connectivity flood fill) ---
   // REVERSAL POINT: This uses "prefer component whose botY reaches lowest,
