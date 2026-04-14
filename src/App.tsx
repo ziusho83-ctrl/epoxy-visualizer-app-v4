@@ -670,7 +670,6 @@ function App() {
               className="stage"
               onPointerDown={(e) => {
                 const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect()
-                const p = toNormalizedPoint(e.clientX, e.clientY, rect)
 
                 if (dragIndex !== null) return
                 const target = e.target as HTMLElement
@@ -680,7 +679,6 @@ function App() {
               }}
               onPointerMove={(e) => {
                 const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect()
-                const p = toNormalizedPoint(e.clientX, e.clientY, rect)
 
                 if (dragIndex === null) return
                 updateMaskPoint(dragIndex, e.clientX, e.clientY, rect)
